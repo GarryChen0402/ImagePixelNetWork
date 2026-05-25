@@ -9,11 +9,13 @@
 | 参数 | 推荐值 | 说明 |
 |------|--------|------|
 | Image Size | 256×256 | 训练图像分辨率 |
-| Batch Size | 8 | GAN 训练内存需求更大 |
+| Batch Size | auto (--auto-batch) | 自动检测 GPU 显存最优值，留 80% headroom |
 | Optimizer (G) | Adam (β1=0.9, β2=0.999) | 标准配置 |
 | Optimizer (D) | Adam (β1=0.9, β2=0.999) | 同 G |
 | Mixed Precision | FP16 | 节省显存，加速训练 |
 | Epochs | 300 | 总训练轮数 |
+
+`--auto-batch` 会在训练开始前从 32 向下二分搜索最大可用 batch size。32GB GPU 实测约 25（80% headroom）。也可手动指定 `--batch-size N`。
 
 ### 损失权重动态调度
 
@@ -138,7 +140,7 @@ python -m src.train \
   --palette Datasets/palette/minecraft_64.npy \
   --gram-stats Datasets/style/minecraft_gram_stats.pt \
   --output outputs/run01 \
-  --batch-size 8 \
+  --auto-batch \
   --epochs 300 \
   --fp16
 ```

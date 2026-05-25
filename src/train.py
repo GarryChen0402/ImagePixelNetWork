@@ -1,18 +1,19 @@
 """Three-phase adversarial training for Photo → Pixel Art translation."""
 
 import argparse
+import gc
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from src.dataset import MinecraftTileBank, PhotoDataset
-from src.discriminator import MultiScaleDiscriminator
+from src.discriminator import PatchDiscriminator
 from src.generator import Generator
 from src.losses import LossManager, r1_penalty
 from src.palette import PaletteQuantizer
@@ -64,9 +65,88 @@ def get_loss_weights(epoch: int, phase: int):
     return w
 
 
+def find_best_batch_size(args, device, start=32, min_batch=2):
+    """Binary search for the largest batch size that fits in GPU memory.
+
+    Runs a quick forward+backward pass with increasing batch sizes.
+    Returns the largest stable batch size.
+    """
+    if device.type != "cuda":
+        return args.batch_size
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
+    free_vram = torch.cuda.get_device_properties(0).total_memory
+    free_vram -= torch.cuda.memory_allocated()
+    free_vram //= 1024 ** 2  # MB
+
+    print(f"Auto batch: testing from {min_batch}..{start} (free VRAM: ~{free_vram} MB)")
+
+    best = min_batch
+
+    for candidate in range(start, min_batch - 1, -2):
+        try:
+            # Build minimal test
+            g = Generator(base_ch=args.base_ch).to(device)
+            d = PatchDiscriminator(base_ch=args.d_ch).to(device)
+            pq = PaletteQuantizer(palette_size=args.palette_size).to(device)
+            loss_mgr = LossManager(device=str(device))
+
+            x = torch.randn(candidate, 3, args.image_size, args.image_size, device=device)
+            real_patches = torch.randn(candidate * 4, 3, 16, 16, device=device)
+
+            # Forward + backward
+            raw = g(x)
+            quantized, sw = pq(raw, return_weights=True)
+
+            fake_patches = crop_patches(quantized, 16, 4)
+            fake_logits = [d(fake_patches)]
+            real_logits = [d(real_patches)]
+
+            g_losses = loss_mgr.compute_g_losses(quantized, x, fake_logits, sw, phase=2)
+            g_total = sum(g_losses.values())
+            g_total.backward()
+
+            fake_logits_d = [d(fake_patches.detach())]
+            d_losses = loss_mgr.compute_d_losses(real_logits, fake_logits_d)
+            d_total = sum(d_losses.values())
+            d_total.backward()
+
+            # Success — this batch size works
+            best = candidate
+            used_mb = torch.cuda.max_memory_allocated() / 1024 ** 2
+            total_mb = torch.cuda.get_device_properties(0).total_memory / 1024 ** 2
+            print(f"  batch={candidate:2d} OK  used={used_mb:.0f}/{total_mb:.0f} MB")
+            break
+
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                print(f"  batch={candidate:2d} OOM, trying smaller...")
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            raise
+        finally:
+            del g, d, pq, loss_mgr, x, raw, quantized
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # Clean up and use 80% of max to leave headroom for phase 2 (adversarial)
+    safe = max(min_batch, int(best * 0.8))
+    print(f"Auto batch: {best} fits, using {safe} (80% headroom)")
+    return safe
+
+
 def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # ── Auto Batch Size ──
+    if args.auto_batch:
+        args.batch_size = find_best_batch_size(args, device)
+        print(f"Auto batch size: {args.batch_size}")
 
     # ── Datasets ──
     root = Path(__file__).resolve().parent.parent
@@ -77,15 +157,18 @@ def train(args):
 
     photo_ds = PhotoDataset(photo_dir, image_size=args.image_size)
     tile_bank = MinecraftTileBank(tile_dir)
+
+    print(f"Photos: {len(photo_ds)}, Tiles: {len(tile_bank)}")
+    print(f"Batch size: {args.batch_size}")
+
     photo_loader = DataLoader(
         photo_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.workers, pin_memory=True, drop_last=True,
     )
-    print(f"Photos: {len(photo_ds)}, Tiles: {len(tile_bank)}")
 
     # ── Models ──
     g = Generator(base_ch=args.base_ch).to(device)
-    d = MultiScaleDiscriminator(base_ch=args.d_ch).to(device)
+    d = PatchDiscriminator(base_ch=args.d_ch).to(device)
     pq = PaletteQuantizer(palette_size=args.palette_size, temperature=1.0).to(device)
 
     if Path(palette_path).exists():
@@ -126,16 +209,22 @@ def train(args):
         if epoch == 1:
             for pg in g_opt.param_groups:
                 pg["lr"] = args.lr_g * 10  # Phase 1 LR = 1e-3
+            for pg in pq_opt.param_groups:
+                pg["lr"] = args.lr_g * 10 * 0.1
         elif epoch == 51:
             for pg in g_opt.param_groups:
                 pg["lr"] = args.lr_g  # Phase 2 LR = 1e-4
             for pg in d_opt.param_groups:
                 pg["lr"] = args.lr_d
+            for pg in pq_opt.param_groups:
+                pg["lr"] = args.lr_g * 0.1
         elif epoch == 201:
             for pg in g_opt.param_groups:
                 pg["lr"] = args.lr_g
             for pg in d_opt.param_groups:
                 pg["lr"] = args.lr_d * 0.25
+            for pg in pq_opt.param_groups:
+                pg["lr"] = args.lr_g * 0.1 * 0.25
 
         pbar = tqdm(photo_loader, desc=f"E{epoch:03d} P{phase} τ={tau:.2f}")
         epoch_losses = {}
@@ -157,7 +246,7 @@ def train(args):
 
             # Discriminator forward (for G loss)
             fake_patches_16 = crop_patches(quantized, 16, 4)  # (B*4, 3, 16, 16)
-            fake_logits = d(fake_patches_16)
+            fake_logits = [d(fake_patches_16)]
 
             g_losses = loss_mgr.compute_g_losses(
                 quantized, photo, fake_logits, soft_w, phase,
@@ -179,11 +268,11 @@ def train(args):
                 d_opt.zero_grad(set_to_none=True)
 
                 real_16 = tile_bank.sample(B * 4, device)
-                real_logits = d(real_16)
+                real_logits = [d(real_16)]
 
                 with torch.no_grad():
                     fake_16 = crop_patches(quantized.detach(), 16, 4)
-                fake_logits_d = d(fake_16)
+                fake_logits_d = [d(fake_16)]
 
                 d_losses = loss_mgr.compute_d_losses(real_logits, fake_logits_d)
                 d_total = sum(d_losses.values())
@@ -286,6 +375,8 @@ def main():
     parser.add_argument("--save-every", type=int, default=10)
     parser.add_argument("--sample-every", type=int, default=5)
     parser.add_argument("--fp16", action="store_true", default=True)
+    parser.add_argument("--auto-batch", action="store_true",
+                        help="Auto-detect optimal batch size for GPU memory")
     args = parser.parse_args()
     train(args)
 

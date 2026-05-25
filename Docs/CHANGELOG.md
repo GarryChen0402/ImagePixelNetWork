@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.2.1 (2026-05-25)
+
+Bug 修复和训练优化。
+
+### Bug 修复
+
+- **train.py**: 修复 `def train(args):` 函数头缺失，导致函数体变成模块级代码
+- **train.py**: 修复 `find_best_batch_size` 中 G/D backward 共享计算图，第二次 backward 报 `retain_graph` 错误
+- **train.py**: 修复 `pq_opt` 在 phase 切换时 LR 从不更新（Phase 1 时仅 G 的 1/100）
+- **discriminator**: 移除 `MultiScaleDiscriminator` 改用 `PatchDiscriminator` — d32 分支从未被调用，参数白占显存且收不到梯度
+- **train.py**: 清理未使用的 import (`F`)、冗余 import (`find_best_batch_size` 内重复)、未使用变量 (`hi`)
+
+### 新增功能
+
+- **`--auto-batch`**: 自动检测 GPU 显存并调整 batch size，使用 80% headroom 防 OOM
+  - 检测方法：从 32 向下二分搜索，实测 forward+backward
+  - 32GB GPU (RTX 4080 SUPER) 实测：batch=32 可装入，safe=25
+
 ## v0.2 (2026-05-25)
 
 非成对数据架构重构。从监督学习切换到 PatchGAN 对抗训练。
