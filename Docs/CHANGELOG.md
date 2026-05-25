@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.2 (2026-05-25)
+
+非成对数据架构重构。从监督学习切换到 PatchGAN 对抗训练。
+
+### 架构变更
+
+- **训练范式**: 成对监督 → 非成对 PatchGAN 对抗训练
+- **判别器**: 新增 16×16 Patch Discriminator，真样本为 Minecraft tiles
+- **损失函数**: 新增 L_adv (Hinge)、L_style_patch (Gram patch)，L_content 改为对比输入-输出
+- **调色板**: 32→64 色，初始化方式从随机 → k-means (Minecraft tiles)
+- **训练**: 200→300 epochs，新增 Phase 1 预训练（无对抗）
+
+### 新增文件
+
+| 文件 | 说明 |
+|------|------|
+| `src/palette.py` | 可微分调色板量化 + k-means 提取 |
+| `src/generator.py` | U-Net 生成器 (55M 参数) |
+| `src/discriminator.py` | PatchGAN 判别器 (660K 参数) |
+| `src/losses.py` | VGG 特征提取 + 6 种损失函数 |
+| `src/dataset.py` | 非成对数据加载 (PhotoDataset + TileBank) |
+| `src/train.py` | 三阶段对抗训练 + FP16 + checkpoint |
+| `scripts/extract_palette.py` | k-means 调色板提取 |
+| `scripts/compute_style_stats.py` | Gram 风格统计预计算 |
+| `scripts/split_collections.py` | Collections.png 拆分 |
+
+### 数据集
+
+- SceneImage: 7,268 张风景照片 (320×180)
+- MinecraftImage: 2,004 张 16×16 tiles (从 Collections.png 拆分)
+- 调色板: k-means 64 色 (从 ~336K pixels 聚类)
+- Gram 统计: relu1_1/relu2_1/relu3_1 均值
+
 ## v0.1 (2026-05-24)
 
 初始设计文档发布。
@@ -16,15 +49,7 @@
 ### 核心设计决策
 
 - **网络结构**：编码器-解码器 + 可微分调色板量化层
-- **量化方式**：温度退火软分配，训练中从 τ=1.0 退火至 τ=0.1
-- **损失函数**：内容损失 + 风格损失 + TV 损失 + 调色板均衡损失
-- **数据策略**：合成数据为主（10K+），真实像素艺术数据为辅（1K+）
-- **训练策略**：三阶段渐进式训练（预训练 → 风格注入 → 精细调优）
-
-### 待完成
-
-- [ ] 源代码实现（`src/`）
-- [ ] 数据集构建脚本
-- [ ] 训练入口脚本
-- [ ] 推理 demo
-- [ ] 预训练模型发布
+- **量化方式**：温度退火软分配
+- **损失函数**：内容 + 风格 + TV + 调色板
+- **数据策略**：合成数据为主，真实像素艺术为辅
+- **训练策略**：三阶段渐进训练
