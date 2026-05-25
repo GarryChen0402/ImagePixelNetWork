@@ -11,11 +11,11 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from dataset import MinecraftTileBank, PhotoDataset
-from discriminator import MultiScaleDiscriminator
-from generator import Generator
-from losses import LossManager, r1_penalty
-from palette import PaletteQuantizer
+from src.dataset import MinecraftTileBank, PhotoDataset
+from src.discriminator import MultiScaleDiscriminator
+from src.generator import Generator
+from src.losses import LossManager, r1_penalty
+from src.palette import PaletteQuantizer
 
 
 def crop_patches(x: torch.Tensor, patch_size: int, n: int):
